@@ -1,7 +1,9 @@
 import math
+import numpy as np
+import torch
 
 def safe_mean(xs: list[float]) -> float:
-    return sum(xs) / len(xs) if xs else 0.0
+    return sum(xs) / len(xs) if xs else None
 
 def precision_at_k(recommended: list[int], relevant: set[int], k: int) -> float:
     """Compute Precision@k for a single user's recommendations.
@@ -114,3 +116,68 @@ def evaluate(
         "recall": safe_mean(recalls),
         "ndcg": safe_mean(ndcgs),
     }
+
+def evaluate_loo(model, user_idx, true_idx, seen, n_movies, k=10, n_neg=100):
+    """Leave-one-out score for a single user.
+
+    Ranks the held-out true item against n_neg random unseen items.
+
+    Args:
+        model: trained recommender (callable on user/movie tensors).
+        user_idx: dense index of the user.
+        true_idx: dense index of the held-out true item.
+        seen: set of movie indices this user saw in training.
+        n_movies: total number of movies.
+        k: cutoff for hit/ndcg.
+        n_neg: number of random distractors.
+
+    Returns:
+        (hit, ndcg) for this user.
+    """
+    negatives = []
+    while len(negatives) < n_neg:
+        cand = np.random.randint(n_movies)
+        if cand not in seen and cand != true_idx:
+            negatives.append(cand)
+
+    candidates = [true_idx] + negatives
+    with torch.no_grad():
+        users = torch.full((len(candidates),), user_idx, dtype=torch.long)
+        movies = torch.tensor(candidates, dtype=torch.long)
+        scores = model(users, movies)
+
+    rank = torch.argsort(scores, descending=True).tolist().index(0)
+    hit = 1.0 if rank < k else 0.0
+    ndcg = 1.0 / np.log2(rank + 2) if rank < k else 0.0
+    return hit, ndcg
+
+
+def score_loo(model, held_out, user_to_idx, movie_to_idx, seen_by_user,
+              n_movies, k=10, n_neg=100):
+    """Average leave-one-out Hit@k and NDCG@k over all held-out users.
+
+    Args:
+        model: trained recommender.
+        held_out: DataFrame indexed by user_id, with a 'movie_id' column
+                  giving each user's single held-out true item.
+        user_to_idx, movie_to_idx: original-id -> dense-index maps.
+        seen_by_user: dict user_idx -> set of seen movie idx.
+        n_movies: total number of movies.
+        k, n_neg: eval settings.
+
+    Returns:
+        (mean_hit, mean_ndcg).
+    """
+    model.eval()
+    hits, ndcgs = [], []
+    for user_id in held_out.index:
+        true_movie = held_out.loc[user_id, "movie_id"]
+        if true_movie not in movie_to_idx:
+            continue
+        user_idx = user_to_idx[user_id]
+        true_idx = movie_to_idx[true_movie]
+        seen = seen_by_user[user_idx]
+        hit, ndcg = evaluate_loo(model, user_idx, true_idx, seen, n_movies, k, n_neg)
+        hits.append(hit)
+        ndcgs.append(ndcg)
+    return np.mean(hits), np.mean(ndcgs)
